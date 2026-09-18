@@ -1,0 +1,24 @@
+name: Check
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  check:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev libx11-xcb-dev libxkbcommon-x11-dev libwayland-dev libvulkan-dev libfontconfig1-dev libfreetype6-dev libxcb-shape0-dev libxcb-xfixes0-dev libx11-dev libxrandr-dev libxi-dev libxcursor-dev libxinerama-dev libegl1-mesa-dev libssl-dev clang cmake pkg-config
+      - run: cargo fmt --check
+      - run: cargo check --all-targets --locked
+      - run: cargo test --locked
+      - run: cargo clippy --all-targets --locked -- -D warnings

@@ -188,7 +188,7 @@ fn refresh_tray(cx: &mut App) {
 }
 
 fn main() -> anyhow::Result<()> {
-    gpui_platform::application()
+    gpui::application()
         .with_quit_mode(QuitMode::Explicit)
         .run(|cx: &mut App| {
             cx.set_global(AppState::new());
@@ -197,6 +197,7 @@ fn main() -> anyhow::Result<()> {
             cx.set_menus(vec![Menu {
                 name: "tray_demo".into(),
                 items: vec![MenuItem::action("Quit", Quit)],
+                disabled: false,
             }]);
 
             cx.activate(true);
@@ -206,7 +207,7 @@ fn main() -> anyhow::Result<()> {
             cx.on_action(hide_window);
             cx.on_action(show_window);
 
-            cx.on_window_closed(|cx| {
+            cx.on_window_closed(|cx, _| {
                 if cx.windows().is_empty() {
                     #[cfg(target_os = "macos")]
                     {
@@ -271,6 +272,11 @@ fn on_tray_event(event: TrayEvent, cx: &mut App) {
 }
 
 fn quit(_: &Quit, cx: &mut App) {
+    if let Some(tray) = cx.global::<AppState>().tray_handle.clone()
+        && let Err(error) = tray.close(cx)
+    {
+        eprintln!("failed to close tray: {error:#}");
+    }
     cx.quit();
 }
 

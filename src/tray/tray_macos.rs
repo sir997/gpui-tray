@@ -23,11 +23,14 @@ use std::{
     sync::{Arc, Mutex, OnceLock},
 };
 
-#[derive(Clone, Default)]
-pub struct TrayHandle;
+#[derive(Clone)]
+pub struct TrayHandle {
+    closed: std::rc::Rc<std::cell::Cell<bool>>,
+}
 
 impl TrayHandle {
     pub fn set_state(&self, state: TrayState) -> Result<()> {
+        anyhow::ensure!(!self.closed.get(), "tray is closed");
         let async_app = TRAY_RUNTIME.with(|runtime_cell| -> Result<Option<AsyncApp>> {
             let mut runtime_slot = runtime_cell
                 .try_borrow_mut()
@@ -40,14 +43,44 @@ impl TrayHandle {
         })?;
 
         if let Some(async_app) = async_app {
-            schedule_flush(async_app);
+            schedule_flush(async_app, self.closed.clone());
         }
 
         Ok(())
     }
 
     pub fn flush_now(&self, _cx: &mut gpui::App) -> Result<()> {
+        anyhow::ensure!(!self.closed.get(), "tray is closed");
         flush_runtime()
+    }
+
+    /// Removes the native tray and permits a new tray to be created.
+    /// All clones of this handle become closed. Call on the GPUI thread.
+    pub fn close(&self, _cx: &mut gpui::App) -> Result<()> {
+        if self.closed.get() {
+            return Ok(());
+        }
+        let runtime = TRAY_RUNTIME.with(|slot| -> Result<_> {
+            let mut slot = slot
+                .try_borrow_mut()
+                .context("tray runtime already borrowed")?;
+            anyhow::ensure!(
+                !slot
+                    .as_ref()
+                    .is_some_and(|runtime| runtime.interaction_active),
+                "tray menu is active"
+            );
+            Ok(slot.take())
+        })?;
+        self.closed.set(true);
+        if let Some(runtime) = &runtime
+            && let Some(platform) = &runtime.platform
+            && let Ok(mut callback) = platform.handler.callback.try_lock()
+        {
+            *callback = None;
+        }
+        drop(runtime);
+        Ok(())
     }
 }
 
@@ -117,6 +150,7 @@ struct TrayPlatform {
 }
 
 struct TrayRuntime {
+    closed: std::rc::Rc<std::cell::Cell<bool>>,
     async_app: AsyncApp,
     state: TrayRuntimeState,
     platform: Option<Box<TrayPlatform>>,
@@ -230,6 +264,7 @@ pub fn set_up_tray(
         let mtm = mtm()?;
         let menu = NSMenu::new(mtm);
 
+        let closed = std::rc::Rc::new(std::cell::Cell::new(false));
         let callback = Arc::new(Mutex::new(Some(on_event)));
         let tag_to_id = Arc::new(Mutex::new(HashMap::new()));
         let handler = Handler {
@@ -257,6 +292,7 @@ pub fn set_up_tray(
             }
 
             *runtime_slot = Some(TrayRuntime {
+                closed: closed.clone(),
                 async_app: async_app.clone(),
                 state: TrayRuntimeState::new(initial),
                 platform: Some(Box::new(TrayPlatform {
@@ -273,17 +309,25 @@ pub fn set_up_tray(
             Ok(())
         })?;
 
-        let handle = TrayHandle;
-        handle.flush_now(cx)?;
+        let handle = TrayHandle { closed };
+        if let Err(error) = handle.flush_now(cx) {
+            handle.close(cx)?;
+            return Err(error);
+        }
         Ok(handle)
     })
 }
 
-fn schedule_flush(async_app: AsyncApp) {
+fn schedule_flush(async_app: AsyncApp, closed: std::rc::Rc<std::cell::Cell<bool>>) {
     let executor = async_app.foreground_executor().clone();
     executor
         .spawn(async move {
-            let _ = flush_runtime();
+            if closed.get() {
+                return;
+            }
+            if let Err(error) = flush_runtime() {
+                log::error!("tray update failed: {error:#}");
+            }
         })
         .detach();
 }
@@ -305,23 +349,25 @@ fn handle_status_item_click() -> Result<()> {
 
     let click_result = platform.handle_status_item_click();
 
-    let async_app = TRAY_RUNTIME.with(|runtime_cell| -> Result<Option<AsyncApp>> {
-        let mut runtime_slot = runtime_cell
-            .try_borrow_mut()
-            .map_err(|_| anyhow::anyhow!("tray runtime already borrowed"))?;
-        let runtime = runtime_slot
-            .as_mut()
-            .context("tray has not been initialized")?;
-        runtime.platform = Some(platform);
-        runtime.interaction_active = false;
-        Ok(runtime
-            .state
-            .has_pending_flush()
-            .then(|| runtime.async_app.clone()))
-    })?;
+    let async_app = TRAY_RUNTIME.with(
+        |runtime_cell| -> Result<Option<(AsyncApp, std::rc::Rc<std::cell::Cell<bool>>)>> {
+            let mut runtime_slot = runtime_cell
+                .try_borrow_mut()
+                .map_err(|_| anyhow::anyhow!("tray runtime already borrowed"))?;
+            let runtime = runtime_slot
+                .as_mut()
+                .context("tray has not been initialized")?;
+            runtime.platform = Some(platform);
+            runtime.interaction_active = false;
+            Ok(runtime
+                .state
+                .has_pending_flush()
+                .then(|| (runtime.async_app.clone(), runtime.closed.clone())))
+        },
+    )?;
 
-    if let Some(async_app) = async_app {
-        schedule_flush(async_app);
+    if let Some((async_app, closed)) = async_app {
+        schedule_flush(async_app, closed);
     }
 
     click_result
@@ -423,13 +469,14 @@ impl TrayPlatform {
         let title = NSString::from_str(state.title.as_str());
         button.setTitle(&title);
 
-        let nsimage = state.icon.as_deref().map(nsimage_from_image).transpose()?;
+        let nsimage = state
+            .icon
+            .as_deref()
+            .map(|image| nsimage_from_image(image, state.icon_size, state.icon_template))
+            .transpose()?;
         if let Some(nsimage) = nsimage {
-            let new_size = NSSize::new(18., 18.);
             button.setImage(Some(&nsimage));
-            nsimage.setSize(new_size);
             button.setImagePosition(NSCellImagePosition::ImageLeft);
-            nsimage.setTemplate(true);
         } else {
             button.setImage(None);
         }
@@ -540,12 +587,28 @@ impl StatusItemClickContext {
     }
 }
 
-fn nsimage_from_image(image: &gpui::Image) -> Result<Retained<NSImage>> {
+fn nsimage_from_image(
+    image: &gpui::Image,
+    points: f64,
+    template: bool,
+) -> Result<Retained<NSImage>> {
     let nsdata = unsafe {
         NSData::dataWithBytes_length(image.bytes.as_ptr().cast(), image.bytes.len() as _)
     };
-    NSImage::initWithData(NSImage::alloc(), &nsdata)
-        .context("failed to create NSImage from gpui::Image bytes")
+    let image = NSImage::initWithData(NSImage::alloc(), &nsdata)
+        .context("failed to create NSImage from gpui::Image bytes")?;
+    image.setSize(fit_icon(image.size(), points)?);
+    image.setTemplate(template);
+    Ok(image)
+}
+
+fn fit_icon(size: NSSize, points: f64) -> Result<NSSize> {
+    anyhow::ensure!(
+        size.width.is_finite() && size.height.is_finite() && size.width > 0.0 && size.height > 0.0,
+        "invalid icon dimensions"
+    );
+    let scale = points / size.width.max(size.height);
+    Ok(NSSize::new(size.width * scale, size.height * scale))
 }
 
 unsafe fn add_tray_menu_item(
@@ -627,4 +690,62 @@ unsafe fn add_tray_menu_item(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod icon_tests {
+    use super::*;
+
+    #[test]
+    fn native_image_has_size_and_template_before_assignment() {
+        autoreleasepool(|_| {
+            let source = gpui::Image::from_bytes(
+                gpui::ImageFormat::Png,
+                include_bytes!("../../examples/app-icon.png").to_vec(),
+            );
+            let image = nsimage_from_image(&source, 18.0, true).unwrap();
+            assert_eq!(image.size(), NSSize::new(18.0, 18.0));
+            assert!(image.isTemplate());
+            let image = nsimage_from_image(&source, 20.0, false).unwrap();
+            assert_eq!(image.size(), NSSize::new(20.0, 20.0));
+            assert!(!image.isTemplate());
+        });
+    }
+
+    #[test]
+    fn closed_handle_rejects_updates_and_invalidates_clones() {
+        let handle = TrayHandle {
+            closed: Default::default(),
+        };
+        let other = handle.clone();
+        handle.closed.set(true);
+        assert!(other.set_state(TrayState::new()).is_err());
+    }
+
+    #[test]
+    fn pixel_density_does_not_change_logical_size() {
+        for pixels in [18.0, 36.0, 72.0, 256.0] {
+            assert_eq!(
+                fit_icon(NSSize::new(pixels, pixels), 18.0).unwrap(),
+                NSSize::new(18.0, 18.0)
+            );
+        }
+    }
+
+    #[test]
+    fn keeps_aspect_ratio() {
+        assert_eq!(
+            fit_icon(NSSize::new(72.0, 36.0), 18.0).unwrap(),
+            NSSize::new(18.0, 9.0)
+        );
+        assert_eq!(
+            fit_icon(NSSize::new(36.0, 72.0), 18.0).unwrap(),
+            NSSize::new(9.0, 18.0)
+        );
+    }
+
+    #[test]
+    fn rejects_empty_images() {
+        assert!(fit_icon(NSSize::new(0.0, 36.0), 18.0).is_err());
+    }
 }

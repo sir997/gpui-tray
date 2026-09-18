@@ -1,6 +1,6 @@
 # gpui-tray
 
-Cross-platform system tray support for apps using upstream `gpui` (from the Zed repository), without modifying `gpui`.
+Cross-platform system tray support for apps using `gpui-kit`. No Zed Git checkout is required.
 
 ## Use
 
@@ -8,19 +8,21 @@ Add the dependency:
 
 ```toml
 [dependencies]
-gpui-tray = { git = "https://github.com/Tryanks/gpui_tray" }
+gpui-kit = { version = "0.6.1", default-features = false }
+gpui-tray = { git = "https://github.com/sir997/gpui-tray" }
 ```
 
 Create and install a tray item:
 
 ```rust
-use gpui::{App, Application};
+use gpui_kit as gpui;
+use gpui::App;
 use gpui_tray::{
     TrayClickAction, TrayClickPolicy, TrayEvent, TrayMenuItem, TrayState,
 };
 
 fn main() -> anyhow::Result<()> {
-    Application::new().run(|cx: &mut App| {
+    gpui::application().run(|cx: &mut App| {
         let async_app = cx.to_async();
 
         let state = TrayState::new()
@@ -63,6 +65,12 @@ fn main() -> anyhow::Result<()> {
 
 Update the tray later by calling `tray.set_state(new_state)`, and call `tray.flush_now(cx)` when you want to eagerly push the latest desired state to the native tray.
 
+Handles are main-thread-only. Call `tray.close(cx)` before discarding a tray;
+dropping a handle alone does not close it. Closing invalidates all clones and
+allows another tray to be created. On Linux, initialization, flushing and closing
+are asynchronous D-Bus operations; errors are reported through the `log` facade.
+Only one tray may be active at a time.
+
 ### Menu Item Capabilities
 
 - `TrayMenuItem::menu(...).enabled(false)` renders a disabled native menu item.
@@ -73,6 +81,10 @@ Update the tray later by calling `tray.set_state(new_state)`, and call `tray.flu
 ### Icon Notes
 
 - `.icon(...)` takes anything convertible into `gpui::Image` (e.g. `gpui::Image::from_bytes(...)`).
+- On macOS icons fit inside **18 × 18 logical points**, preserving aspect ratio. Pixel dimensions do not control the menu-bar size.
+- Use a **36 × 36 pixel PNG** for a square Retina icon, with consistent transparent padding across states. Source pixels are not downsampled by this crate.
+- `.icon_size(18.0)` changes the macOS logical bounding box; `.icon_template(false)` preserves colors instead of system tinting. Template mode defaults to true and adapts to light/dark appearance.
+- Sizing and template flags are applied before assigning the image to the native button, on both initial creation and state updates. These flags have no effect on Windows/Linux.
 
 ## Run Demo
 

@@ -33,20 +33,23 @@ use windows_sys::Win32::{
             CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyMenu, DestroyWindow, GetCursorPos,
             HICON, HMENU, ICONINFO, IDC_ARROW, IDI_APPLICATION, LoadCursorW, LoadIconW, MF_CHECKED,
             MF_DISABLED, MF_POPUP, MF_SEPARATOR, MF_STRING, MF_UNCHECKED, PostMessageW,
-            PostQuitMessage, RegisterClassW, SetForegroundWindow, TPM_BOTTOMALIGN, TPM_LEFTALIGN,
-            TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, WM_COMMAND, WM_CONTEXTMENU, WM_CREATE,
-            WM_DESTROY, WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_NULL, WM_RBUTTONUP, WM_USER, WNDCLASSW,
+            RegisterClassW, SetForegroundWindow, TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_RETURNCMD,
+            TPM_RIGHTBUTTON, TrackPopupMenu, WM_COMMAND, WM_CONTEXTMENU, WM_CREATE, WM_DESTROY,
+            WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_NULL, WM_RBUTTONUP, WM_USER, WNDCLASSW,
             WS_OVERLAPPEDWINDOW,
         },
     },
 };
 use windows_sys::core::BOOL;
 
-#[derive(Clone, Default)]
-pub struct TrayHandle;
+#[derive(Clone)]
+pub struct TrayHandle {
+    closed: std::rc::Rc<std::cell::Cell<bool>>,
+}
 
 impl TrayHandle {
     pub fn set_state(&self, state: TrayState) -> Result<()> {
+        anyhow::ensure!(!self.closed.get(), "tray is closed");
         let async_app = TRAY_RUNTIME.with(|runtime_cell| -> Result<Option<AsyncApp>> {
             let mut runtime_slot = runtime_cell
                 .try_borrow_mut()
@@ -59,14 +62,44 @@ impl TrayHandle {
         })?;
 
         if let Some(async_app) = async_app {
-            schedule_flush(async_app);
+            schedule_flush(async_app, self.closed.clone());
         }
 
         Ok(())
     }
 
     pub fn flush_now(&self, _cx: &mut gpui::App) -> Result<()> {
+        anyhow::ensure!(!self.closed.get(), "tray is closed");
         flush_runtime()
+    }
+
+    /// Removes the native tray and permits a new tray to be created.
+    /// All clones of this handle become closed. Call on the GPUI thread.
+    pub fn close(&self, _cx: &mut gpui::App) -> Result<()> {
+        if self.closed.get() {
+            return Ok(());
+        }
+        let runtime = TRAY_RUNTIME.with(|slot| -> Result<_> {
+            let mut slot = slot
+                .try_borrow_mut()
+                .context("tray runtime already borrowed")?;
+            anyhow::ensure!(
+                !slot
+                    .as_ref()
+                    .is_some_and(|runtime| runtime.interaction_active),
+                "tray menu is active"
+            );
+            Ok(slot.take())
+        })?;
+        self.closed.set(true);
+        if let Some(runtime) = &runtime
+            && let Some(platform) = &runtime.platform
+            && let Ok(mut callback) = platform.handler.callback.try_lock()
+        {
+            *callback = None;
+        }
+        drop(runtime);
+        Ok(())
     }
 }
 
@@ -125,6 +158,7 @@ struct TrayPlatform {
 }
 
 struct TrayRuntime {
+    closed: std::rc::Rc<std::cell::Cell<bool>>,
     async_app: AsyncApp,
     state: TrayRuntimeState,
     platform: Option<Box<TrayPlatform>>,
@@ -212,10 +246,7 @@ unsafe extern "system" fn wndproc(
             }
             0
         }
-        WM_DESTROY => {
-            PostQuitMessage(0);
-            0
-        }
+        WM_DESTROY => 0,
         _ => DefWindowProcW(hwnd, message, wparam, lparam),
     }
 }
@@ -262,6 +293,7 @@ pub fn set_up_tray(
 
     register_window_class(instance)?;
 
+    let closed = std::rc::Rc::new(std::cell::Cell::new(false));
     let callback = Arc::new(Mutex::new(Some(on_event)));
     let id_to_menu_id = Arc::new(Mutex::new(HashMap::new()));
     let handler = Handler {
@@ -315,6 +347,7 @@ pub fn set_up_tray(
         }
 
         *runtime_slot = Some(TrayRuntime {
+            closed: closed.clone(),
             async_app: async_app.clone(),
             state: TrayRuntimeState::new(initial),
             platform: Some(platform),
@@ -323,16 +356,24 @@ pub fn set_up_tray(
         Ok(())
     })?;
 
-    let handle = TrayHandle;
-    handle.flush_now(cx)?;
+    let handle = TrayHandle { closed };
+    if let Err(error) = handle.flush_now(cx) {
+        handle.close(cx)?;
+        return Err(error);
+    }
     Ok(handle)
 }
 
-fn schedule_flush(async_app: AsyncApp) {
+fn schedule_flush(async_app: AsyncApp, closed: std::rc::Rc<std::cell::Cell<bool>>) {
     async_app
         .foreground_executor()
         .spawn(async move {
-            let _ = flush_runtime();
+            if closed.get() {
+                return;
+            }
+            if let Err(error) = flush_runtime() {
+                log::error!("tray update failed: {error:#}");
+            }
         })
         .detach();
 }
@@ -354,23 +395,25 @@ fn handle_tray_click(click_code: usize) -> Result<()> {
 
     let click_result = unsafe { platform.handle_click(click_code) };
 
-    let async_app = TRAY_RUNTIME.with(|runtime_cell| -> Result<Option<AsyncApp>> {
-        let mut runtime_slot = runtime_cell
-            .try_borrow_mut()
-            .map_err(|_| anyhow::anyhow!("tray runtime already borrowed"))?;
-        let runtime = runtime_slot
-            .as_mut()
-            .context("tray has not been initialized")?;
-        runtime.platform = Some(platform);
-        runtime.interaction_active = false;
-        Ok(runtime
-            .state
-            .has_pending_flush()
-            .then(|| runtime.async_app.clone()))
-    })?;
+    let async_app = TRAY_RUNTIME.with(
+        |runtime_cell| -> Result<Option<(AsyncApp, std::rc::Rc<std::cell::Cell<bool>>)>> {
+            let mut runtime_slot = runtime_cell
+                .try_borrow_mut()
+                .map_err(|_| anyhow::anyhow!("tray runtime already borrowed"))?;
+            let runtime = runtime_slot
+                .as_mut()
+                .context("tray has not been initialized")?;
+            runtime.platform = Some(platform);
+            runtime.interaction_active = false;
+            Ok(runtime
+                .state
+                .has_pending_flush()
+                .then(|| (runtime.async_app.clone(), runtime.closed.clone())))
+        },
+    )?;
 
-    if let Some(async_app) = async_app {
-        schedule_flush(async_app);
+    if let Some((async_app, closed)) = async_app {
+        schedule_flush(async_app, closed);
     }
 
     click_result
@@ -586,25 +629,28 @@ impl TrayPlatform {
     }
 
     unsafe fn rebuild_menu(&mut self, items: &[TrayMenuItem]) -> Result<()> {
-        if self.menu != ptr::null_mut() {
-            DestroyMenu(self.menu);
-        }
-
         let menu = CreatePopupMenu();
-        (menu != ptr::null_mut())
-            .then_some(())
-            .context("CreatePopupMenu failed")?;
-
-        if let Ok(mut map) = self.handler.id_to_menu_id.lock() {
-            map.clear();
-        }
-
+        anyhow::ensure!(!menu.is_null(), "CreatePopupMenu failed");
+        let map = Arc::new(Mutex::new(HashMap::new()));
         let mut next_id: u16 = 1000;
         for item in items {
-            append_tray_menu_item(menu, item, &self.handler.id_to_menu_id, &mut next_id)?;
+            if let Err(error) = append_tray_menu_item(menu, item, &map, &mut next_id) {
+                DestroyMenu(menu);
+                return Err(error);
+            }
         }
-
-        self.menu = menu;
+        let old = mem::replace(&mut self.menu, menu);
+        *self
+            .handler
+            .id_to_menu_id
+            .lock()
+            .map_err(|_| anyhow::anyhow!("menu map poisoned"))? = map
+            .lock()
+            .map_err(|_| anyhow::anyhow!("menu map poisoned"))?
+            .clone();
+        if !old.is_null() {
+            DestroyMenu(old);
+        }
         Ok(())
     }
 
@@ -761,7 +807,12 @@ unsafe fn append_tray_menu_item(
                     .then_some(())
                     .context("CreatePopupMenu(submenu) failed")?;
                 for child in children {
-                    append_tray_menu_item(submenu, child, id_to_menu_id, next_id)?;
+                    if let Err(error) =
+                        append_tray_menu_item(submenu, child, id_to_menu_id, next_id)
+                    {
+                        DestroyMenu(submenu);
+                        return Err(error);
+                    }
                 }
 
                 let label_w = to_wide_null(label);
@@ -771,6 +822,7 @@ unsafe fn append_tray_menu_item(
                 }
                 let ok: BOOL = AppendMenuW(menu, flags, submenu as usize, label_w.as_ptr());
                 if ok == 0 {
+                    DestroyMenu(submenu);
                     anyhow::bail!("AppendMenuW(submenu) failed")
                 }
             }

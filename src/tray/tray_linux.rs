@@ -5,8 +5,10 @@ use crate::tray::{
 };
 use anyhow::{Context as _, Result};
 use gpui::{AsyncApp, MouseButton, Point};
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, OnceLock, atomic::AtomicU32, atomic::Ordering};
+use std::rc::{Rc, Weak};
+use std::sync::{Arc, Mutex, atomic::AtomicU32, atomic::Ordering};
 
 const STATUS_NOTIFIER_WATCHER_INTERFACE: &str = "org.kde.StatusNotifierWatcher";
 const STATUS_NOTIFIER_WATCHER_PATH: &str = "/StatusNotifierWatcher";
@@ -643,9 +645,11 @@ impl StatusNotifierItemInterface {
 
 enum Command {
     Flush,
+    Close,
 }
 
 struct LinuxTrayInner {
+    closed: Cell<bool>,
     runtime: Mutex<TrayRuntimeState>,
     callback: TrayEventCallbackSlot,
     cmd_tx: tokio::sync::mpsc::UnboundedSender<Command>,
@@ -653,42 +657,70 @@ struct LinuxTrayInner {
 
 #[derive(Clone)]
 pub struct TrayHandle {
-    inner: Arc<LinuxTrayInner>,
+    inner: Rc<LinuxTrayInner>,
 }
 
 impl TrayHandle {
     pub fn set_state(&self, state: TrayState) -> Result<()> {
+        anyhow::ensure!(!self.inner.closed.get(), "tray is closed");
         let should_flush = self
             .inner
             .runtime
             .lock()
             .map(|mut runtime| runtime.set_desired_state(state))
-            .unwrap_or(false);
+            .map_err(|_| anyhow::anyhow!("tray state lock poisoned"))?;
 
         if should_flush {
-            let _ = self.inner.cmd_tx.send(Command::Flush);
+            self.inner
+                .cmd_tx
+                .send(Command::Flush)
+                .context("tray backend stopped")?;
         }
 
         Ok(())
     }
 
+    /// Queues a D-Bus update; completion is asynchronous on Linux.
     pub fn flush_now(&self, _cx: &mut gpui::App) -> Result<()> {
+        anyhow::ensure!(!self.inner.closed.get(), "tray is closed");
         let should_flush = self
             .inner
             .runtime
             .lock()
             .map(|mut runtime| runtime.request_flush())
-            .unwrap_or(false);
+            .map_err(|_| anyhow::anyhow!("tray state lock poisoned"))?;
 
         if should_flush {
-            let _ = self.inner.cmd_tx.send(Command::Flush);
+            self.inner
+                .cmd_tx
+                .send(Command::Flush)
+                .context("tray backend stopped")?;
         }
 
         Ok(())
     }
 }
 
-static LINUX_TRAY: OnceLock<TrayHandle> = OnceLock::new();
+impl TrayHandle {
+    /// Stops the D-Bus backend and releases its registration asynchronously.
+    pub fn close(&self, _cx: &mut gpui::App) -> Result<()> {
+        if self.inner.closed.replace(true) {
+            return Ok(());
+        }
+        LINUX_TRAY.with(|slot| *slot.borrow_mut() = Weak::new());
+        if let Ok(mut callback) = self.inner.callback.try_lock() {
+            *callback = None;
+        }
+        self.inner
+            .cmd_tx
+            .send(Command::Close)
+            .context("tray backend stopped")
+    }
+}
+
+thread_local! {
+    static LINUX_TRAY: RefCell<Weak<LinuxTrayInner>> = const { RefCell::new(Weak::new()) };
+}
 
 fn make_bus_name() -> String {
     // Format inspired by common implementations; must be a unique well-formed bus name.
@@ -725,7 +757,11 @@ pub fn set_up_tray(
     initial: TrayState,
     on_event: TrayEventCallback,
 ) -> Result<TrayHandle> {
-    if LINUX_TRAY.get().is_some() {
+    if LINUX_TRAY.with(|slot| {
+        slot.borrow()
+            .upgrade()
+            .is_some_and(|inner| !inner.closed.get())
+    }) {
         anyhow::bail!("tray already initialized");
     }
 
@@ -741,22 +777,22 @@ pub fn set_up_tray(
     let revision = Arc::new(AtomicU32::new(1));
 
     let handle = TrayHandle {
-        inner: Arc::new(LinuxTrayInner {
+        inner: Rc::new(LinuxTrayInner {
+            closed: Cell::new(false),
             runtime: Mutex::new(TrayRuntimeState::new(initial)),
             callback: callback.clone(),
             cmd_tx: cmd_tx.clone(),
         }),
     };
 
-    LINUX_TRAY
-        .set(handle.clone())
-        .map_err(|_| anyhow::anyhow!("tray storage already initialized"))?;
+    LINUX_TRAY.with(|slot| *slot.borrow_mut() = Rc::downgrade(&handle.inner));
 
+    let task_handle = handle.clone();
     async_app
         .spawn(move |cx: &mut AsyncApp| {
             let async_app = cx.clone();
             let callback = callback.clone();
-            let handle = handle.clone();
+            let handle = task_handle.clone();
             let click_policy = click_policy.clone();
             async move {
                 let service = make_bus_name();
@@ -772,32 +808,23 @@ pub fn set_up_tray(
                     events: event_tx.clone(),
                 };
 
-                let builder = zbus::connection::Builder::session();
-                let Ok(builder) = builder else {
-                    return;
+                let connection = async {
+                    let connection = zbus::connection::Builder::session()?
+                        .name(service.clone())?
+                        .serve_at(STATUS_NOTIFIER_ITEM_PATH, status_iface)?
+                        .serve_at(DBUS_MENU_PATH, menu_iface)?
+                        .build().await?;
+                    register_with_watcher(&connection, &service).await?;
+                    Ok::<_, zbus::Error>(connection)
+                }.await;
+                let connection = match connection {
+                    Ok(connection) => connection,
+                    Err(error) => {
+                        log::error!("tray initialization failed: {error}");
+                        handle.inner.closed.set(true);
+                        return;
+                    }
                 };
-
-                let builder = builder.name(service.clone());
-                let Ok(builder) = builder else {
-                    return;
-                };
-
-                let builder = builder.serve_at(STATUS_NOTIFIER_ITEM_PATH, status_iface);
-                let Ok(builder) = builder else {
-                    return;
-                };
-
-                let builder = builder.serve_at(DBUS_MENU_PATH, menu_iface);
-                let Ok(builder) = builder else {
-                    return;
-                };
-
-                let connection = builder.build().await;
-                let Ok(connection) = connection else {
-                    return;
-                };
-
-                let _ = register_with_watcher(&connection, &service).await;
 
                 let status_ref = connection
                     .object_server()
@@ -811,11 +838,12 @@ pub fn set_up_tray(
                     .ok();
 
                 loop {
+                    if handle.inner.closed.get() { break; }
                     tokio::select! {
                         Some(cmd) = cmd_rx.recv() => {
                             match cmd {
                                 Command::Flush => {
-                                    let _ = flush_linux_runtime(
+                                    if let Err(error) = flush_linux_runtime(
                                         &handle,
                                         &state,
                                         &click_policy,
@@ -824,8 +852,9 @@ pub fn set_up_tray(
                                         status_ref.as_ref(),
                                         menu_ref.as_ref(),
                                     )
-                                    .await;
+                                    .await { log::error!("tray update failed: {error:#}"); }
                                 }
+                                Command::Close => break,
                             }
                         }
                         Some(ev) = event_rx.recv() => {
@@ -930,7 +959,7 @@ async fn flush_linux_runtime(
                     false
                 }
             })
-            .unwrap_or(false);
+            .map_err(|_| anyhow::anyhow!("tray state lock poisoned"))?;
 
         apply_result?;
 

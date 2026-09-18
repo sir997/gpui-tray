@@ -230,6 +230,8 @@ pub enum TrayEvent {
 pub struct TrayState {
     pub(crate) visible: bool,
     pub(crate) icon: Option<Rc<Image>>,
+    pub(crate) icon_size: f64,
+    pub(crate) icon_template: bool,
     pub(crate) title: String,
     pub(crate) tooltip: String,
     pub(crate) description: String,
@@ -242,6 +244,8 @@ impl TrayState {
         Self {
             visible: true,
             icon: None,
+            icon_size: 18.0,
+            icon_template: true,
             title: String::new(),
             tooltip: String::new(),
             description: String::new(),
@@ -262,6 +266,25 @@ impl TrayState {
 
     pub fn title(mut self, title: impl Into<String>) -> Self {
         self.title = title.into();
+        self
+    }
+
+    /// macOS: fit the icon inside a square of this size in logical points.
+    /// Defaults to 18pt. Source pixels are retained for Retina displays.
+    /// Panics if the size is not finite and positive. Other platforms ignore it.
+    pub fn icon_size(mut self, points: f64) -> Self {
+        assert!(
+            points.is_finite() && points > 0.0,
+            "icon size must be finite and positive"
+        );
+        self.icon_size = points;
+        self
+    }
+
+    /// macOS: let AppKit tint the alpha mask for the current appearance.
+    /// Defaults to true. Set false to preserve colored artwork.
+    pub fn icon_template(mut self, template: bool) -> Self {
+        self.icon_template = template;
         self
     }
 
@@ -361,7 +384,7 @@ impl TrayRuntimeState {
 
     pub(crate) fn abort_flush(&mut self) {
         self.flushing = false;
-        self.flush_scheduled = true;
+        self.flush_scheduled = false;
     }
 
     pub(crate) fn has_pending_flush(&self) -> bool {
@@ -436,6 +459,22 @@ mod tests {
     use super::{TrayRuntimeState, TrayState};
 
     #[test]
+    fn icon_options_have_retina_safe_defaults() {
+        let state = TrayState::new();
+        assert_eq!(state.icon_size, 18.0);
+        assert!(state.icon_template);
+        let changed = state.icon_size(20.0).icon_template(false).clone();
+        assert_eq!(changed.icon_size, 20.0);
+        assert!(!changed.icon_template);
+    }
+
+    #[test]
+    #[should_panic(expected = "icon size must be finite and positive")]
+    fn rejects_invalid_icon_size() {
+        TrayState::new().icon_size(f64::NAN);
+    }
+
+    #[test]
     fn tray_state_clones_builder_data() {
         let state = TrayState::new()
             .title("hello")
@@ -478,7 +517,9 @@ mod tests {
 
         runtime.abort_flush();
 
-        assert!(runtime.has_pending_flush());
+        assert!(!runtime.has_pending_flush());
         assert!(!runtime.flushing);
+        assert!(runtime.set_desired_state(TrayState::new().title("retry")));
+        assert_eq!(runtime.try_begin_flush().unwrap().state.title, "retry");
     }
 }
