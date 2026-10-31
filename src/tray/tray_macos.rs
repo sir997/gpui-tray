@@ -141,6 +141,7 @@ struct StatusItemClickContext {
 }
 
 struct TrayPlatform {
+    applied_menu: Option<Vec<TrayMenuItem>>,
     mtm: MainThreadMarker,
     status_item: Option<Retained<NSStatusItem>>,
     menu: Retained<NSMenu>,
@@ -296,6 +297,7 @@ pub fn set_up_tray(
                 async_app: async_app.clone(),
                 state: TrayRuntimeState::new(initial),
                 platform: Some(Box::new(TrayPlatform {
+                    applied_menu: None,
                     mtm,
                     status_item: None,
                     menu,
@@ -450,7 +452,10 @@ impl TrayPlatform {
             return Ok(());
         }
 
-        self.rebuild_menu(&state.submenus)?;
+        if self.applied_menu.as_ref() != Some(&state.submenus) {
+            self.rebuild_menu(&state.submenus)?;
+            self.applied_menu = Some(state.submenus.clone());
+        }
 
         let status_item = self.status_item.as_ref().context("status item is nil")?;
         let button = status_item
@@ -468,6 +473,12 @@ impl TrayPlatform {
 
         let title = NSString::from_str(state.title.as_str());
         button.setTitle(&title);
+        if let Some((title, width)) = &state.attributed_title {
+            button.setAttributedTitle(title);
+            status_item.setLength(*width);
+        } else {
+            status_item.setLength(NSVariableStatusItemLength);
+        }
 
         let nsimage = state
             .icon

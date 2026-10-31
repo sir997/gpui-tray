@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 pub(crate) type TrayEventCallback = Box<dyn FnMut(TrayEvent, &mut App) + Send + 'static>;
 pub(crate) type TrayEventCallbackSlot = Arc<Mutex<Option<TrayEventCallback>>>;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum TrayToggleType {
     Checkbox(bool),
     Radio(bool),
@@ -18,7 +18,7 @@ pub enum TrayMenuItemRole {
 }
 
 /// Item used to describe a tray context menu.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum TrayMenuItem {
     Separator {
         label: Option<String>,
@@ -228,6 +228,11 @@ pub enum TrayEvent {
 
 #[derive(Clone)]
 pub struct TrayState {
+    #[cfg(target_os = "macos")]
+    pub(crate) attributed_title: Option<(
+        objc2::rc::Retained<objc2_foundation::NSAttributedString>,
+        f64,
+    )>,
     pub(crate) visible: bool,
     pub(crate) icon: Option<Rc<Image>>,
     pub(crate) icon_size: f64,
@@ -242,6 +247,8 @@ pub struct TrayState {
 impl TrayState {
     pub fn new() -> Self {
         Self {
+            #[cfg(target_os = "macos")]
+            attributed_title: None,
             visible: true,
             icon: None,
             icon_size: 18.0,
@@ -266,6 +273,18 @@ impl TrayState {
 
     pub fn title(mut self, title: impl Into<String>) -> Self {
         self.title = title.into();
+        self
+    }
+
+    /// Sets a styled macOS title and fixed total width, including the icon.
+    #[cfg(target_os = "macos")]
+    pub fn attributed_title(
+        mut self,
+        title: objc2::rc::Retained<objc2_foundation::NSAttributedString>,
+        width: f64,
+    ) -> Self {
+        assert!(width.is_finite() && width > 0.0);
+        self.attributed_title = Some((title, width));
         self
     }
 
