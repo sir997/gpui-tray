@@ -508,6 +508,10 @@ impl TrayPlatform {
 
             let status_bar = NSStatusBar::systemStatusBar();
             let status_item = status_bar.statusItemWithLength(NSVariableStatusItemLength);
+            // AppKit may restore a hidden state from a previous status item at
+            // the same position (for example after merging two items into one).
+            // Honor TrayState::visible rather than that stale persisted state.
+            status_item.setVisible(true);
             self.status_item = Some(status_item);
         } else {
             if self.status_item.is_none() {
