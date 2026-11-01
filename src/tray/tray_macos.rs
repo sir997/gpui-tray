@@ -13,7 +13,7 @@ use objc2::{AnyThread, ClassType, MainThreadMarker, MainThreadOnly, msg_send, se
 use objc2_app_kit::{
     NSApplication, NSCellImagePosition, NSControlStateValueOff, NSControlStateValueOn, NSEvent,
     NSEventMask, NSEventType, NSImage, NSMenu, NSMenuItem, NSStatusBar, NSStatusItem,
-    NSVariableStatusItemLength,
+    NSTextAlignment, NSVariableStatusItemLength,
 };
 use objc2_foundation::{NSData, NSSize, NSString};
 use std::{
@@ -471,12 +471,18 @@ impl TrayPlatform {
         let tooltip = NSString::from_str(state.tooltip.as_str());
         button.setToolTip(Some(&tooltip));
 
-        let title = NSString::from_str(state.title.as_str());
-        button.setTitle(&title);
         if let Some((title, width)) = &state.attributed_title {
+            // Keep the frame and column origin stable across text updates.
+            // Clearing the plain title first transiently removes all text and
+            // triggers an unnecessary AppKit layout pass.
+            if status_item.length() != *width {
+                status_item.setLength(*width);
+            }
+            button.setAlignment(NSTextAlignment::Left);
             button.setAttributedTitle(title);
-            status_item.setLength(*width);
         } else {
+            let title = NSString::from_str(state.title.as_str());
+            button.setTitle(&title);
             status_item.setLength(NSVariableStatusItemLength);
         }
 
